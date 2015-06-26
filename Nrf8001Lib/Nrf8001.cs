@@ -15,7 +15,31 @@ namespace Nrf8001Lib
 
         private OutputPort _req, _rst;
         private InterruptPort _rdy;
+
         private SPI _spi;
+
+        /// <summary>
+        /// SPI Configuration. SCK idle low. Posedge.
+        /// Used for SPI write and read operation. 
+        /// After using this configuration, it will leave the SCK idle on low. 
+        /// But, if the write operation starts with the SCK low then it will lose the first bit (first SCK posedge), 
+        /// because the MOSI only switch on the negedge of SCK. The first SCK posedge wont have a valid MOSI, losing the first bit of the length byte.
+        /// Thus a write operation needs a SCK idle on high. 
+        /// </summary>
+        private SPI.Configuration ConfigRd;
+        /// <summary>
+        /// SPI Configuration. SCK idle high. Posedge. 
+        /// After using this configuration, it will leave the SCK idle on high.
+        /// Used for setting the SCK to high before a SPI write operation. 
+        /// Dont not use this for write or read operation, since the nRF8001 needs the SPI mode 0 (SCK idle low, posedge).
+        /// Use this configuration only to reset the SCK.
+        /// </summary>
+        private SPI.Configuration ConfigWr;
+
+        /// <summary>
+        /// Queue that stores all events received from nRF8001. 
+        /// It adds Events, when RDY pin triggers the interrupt.
+        /// </summary>
         private Queue _eventQueue;
 
         /// <summary>
@@ -46,20 +70,21 @@ namespace Nrf8001Lib
         /// <param name="reqPin">The application controller pin that the nRF8001's REQn pin is connected to.</param>
         /// <param name="rdyPin">The application controller pin that the nRF8001's RDYn pin is connected to.</param>
         /// <param name="spiModule">The SPI module to use for communication with the nRF8001.</param>
-        public Nrf8001(Cpu.Pin rstPin, Cpu.Pin reqPin, Cpu.Pin rdyPin, SPI.SPI_module spiModule)
+        public Nrf8001(Cpu.Pin rstPin, Cpu.Pin reqPin, Cpu.Pin rdyPin, Cpu.Pin SPI_cs, SPI.SPI_module spiModule)
         {
             _rst = new OutputPort(rstPin, true);
             _req = new OutputPort(reqPin, true);
             _rdy = new InterruptPort(rdyPin, false, Port.ResistorMode.PullUp, Port.InterruptMode.InterruptEdgeLow);
 
-            _spi = new SPI(new SPI.Configuration(Cpu.Pin.GPIO_NONE, false, 0, 0, false, true, 100, spiModule));
+            ConfigRd = new SPI.Configuration(Cpu.Pin.GPIO_NONE, false, 0, 0, false, true, 100, spiModule);
+            ConfigWr = new SPI.Configuration(Cpu.Pin.GPIO_NONE, false, 0, 0, true, true, 100, spiModule);
+            _spi = new SPI(ConfigRd);
 
             State = Nrf8001State.Unknown;
             _eventQueue = new Queue();
 
             // Reset the nRF8001
             Reset();
-
             _rdy.OnInterrupt += new NativeEventHandler(OnRdyInterrupt);
         }
 
@@ -69,12 +94,11 @@ namespace Nrf8001Lib
         public void Reset()
         {
             State = Nrf8001State.Resetting;
-
             _rst.Write(false);
             Thread.Sleep(10);
-
             _eventQueue.Clear();
             _rst.Write(true);
+           
         }
 
         /// <summary>
@@ -84,19 +108,20 @@ namespace Nrf8001Lib
         public AciEvent HandleEvent()
         {
             if (_eventQueue.Count == 0)
+            {
                 return null;
-
+            }
             var nrfEvent = (AciEvent)_eventQueue.Dequeue();
 
             // Device events
             switch (nrfEvent.EventType)
             {
-                case Nrf8001EventType.DeviceStarted:
+                case Nrf8001EventType.DeviceStarted: // 0x81
                     State = (Nrf8001State)nrfEvent.Data[1];
                     DataCreditsAvailable = nrfEvent.Data[3];
                     break;
 
-                case Nrf8001EventType.Connected:
+                case Nrf8001EventType.Connected: //0x85
                     State = Nrf8001State.Connected;
                     break;
 
@@ -142,7 +167,7 @@ namespace Nrf8001Lib
             if (State != Nrf8001State.Test)
                 throw new InvalidOperationException("The device is not in Test mode.");
 
-            AciSend(AciOpCode.Echo, data);
+            AciSendSetup(AciOpCode.Echo, data);
         }
 
         /// <summary>
@@ -179,7 +204,7 @@ namespace Nrf8001Lib
         /// <param name="data">The setup data to upload.</param>
         public void Setup(byte[] data)
         {
-            AciSend(AciOpCode.Setup, data);
+            AciSendSetup(AciOpCode.Setup, data);
         }
 
         /// <summary>
@@ -249,8 +274,14 @@ namespace Nrf8001Lib
         #endregion
 
         #region ACI Interface
+
+        /// <summary>
+        /// Normal AciSend. It calculates the packet lenght.
+        /// </summary>
         protected void AciSend(AciOpCode opCode, params byte[] data)
         {
+            resetSPI_SCK();
+            
             if (data.Length > 30)
                 throw new ArgumentOutOfRangeException("data", "The maximum amount of data bytes is 30.");
 
@@ -263,14 +294,14 @@ namespace Nrf8001Lib
             // Request transfer
             _rdy.DisableInterrupt();
             _req.Write(false);
-
+        
             // Wait for RDY to go low
             while (_rdy.Read()) ;
 
             _spi.WriteLsb(packet);
 
             _req.Write(true);
-
+     
             // Wait for RDY to go high
             while (!_rdy.Read()) ;
             _rdy.EnableInterrupt();
@@ -286,15 +317,56 @@ namespace Nrf8001Lib
             AciSend(opCode, buffer);
         }
 
+        /// <summary>
+        /// Reset the SCK idle to high, so that Aci can corretly transfer data.
+        /// </summary>
+        protected void resetSPI_SCK()
+        {
+            byte[] nothing = new byte[] { 0x00, };
+            _spi.Config = ConfigWr;
+            _spi.Write(nothing);
+            _spi.Config = ConfigRd;
+        }
+        /// <summary>
+        /// Modified AciSend for Setup only. It calculates doesn't calculate the packet length.
+        /// </summary>
+        protected void AciSendSetup(AciOpCode opCode, byte[] data)
+        {
+
+            resetSPI_SCK();
+
+            if (data.Length > 32)
+                throw new ArgumentOutOfRangeException("data", "The maximum amount of data bytes is 30.");
+
+
+            SPIExtensions.InvertBytes(data);
+
+            // Request transfer
+            _rdy.DisableInterrupt();
+            _req.Write(false);
+            
+            // Wait for RDY to go low
+            while (_rdy.Read()) ;
+
+            _spi.Write(data);
+
+            _req.Write(true);
+     
+            // Wait for RDY to go high
+            while (!_rdy.Read()) ;
+            _rdy.EnableInterrupt();
+
+        }
+
+        
         protected byte[] AciReceive()
         {
             // Create a new read buffer
             var readBuffer = new byte[2];
-
             // Start SPI communication
             _req.Write(false);
 
-            _spi.WriteReadLsb(ReadEventLengthBuffer, readBuffer);
+            _spi.WriteReadLsb(ReadEventLengthBuffer, readBuffer); // get incomming packet length
 
             // Check event packet length
             if (readBuffer[1] > 0)
@@ -302,7 +374,7 @@ namespace Nrf8001Lib
                 readBuffer = new byte[readBuffer[1]];
                 _spi.WriteReadLsb(new byte[readBuffer.Length], readBuffer);
             }
-            
+
             // SPI communication done
             _req.Write(true);
 
@@ -314,5 +386,8 @@ namespace Nrf8001Lib
         {
             _eventQueue.Enqueue(new AciEvent(AciReceive()));
         }
+
+
     }
+
 }
